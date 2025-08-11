@@ -1,4 +1,4 @@
-# GitHub OIDC Provider for AWS
+# GitHub OIDC Provider for AWS (creates if doesn't exist)
 resource "aws_iam_openid_connect_provider" "github" {
   url = "https://token.actions.githubusercontent.com"
 
@@ -12,11 +12,20 @@ resource "aws_iam_openid_connect_provider" "github" {
   ]
 
   tags = {
-    Name = "${var.cluster_name}-github-oidc"
+    Name        = "github-oidc-provider"
+    Environment = "shared"
+    ManagedBy   = "terraform"
+  }
+
+  lifecycle {
+    ignore_changes = [
+      thumbprint_list,
+      client_id_list
+    ]
   }
 }
 
-# IAM Role for GitHub Actions
+# IAM Role for GitHub Actions (unique per project)
 resource "aws_iam_role" "github_actions" {
   name = "${var.cluster_name}-github-actions-role"
 
@@ -42,13 +51,15 @@ resource "aws_iam_role" "github_actions" {
   })
 
   tags = {
-    Name = "${var.cluster_name}-github-actions-role"
+    Name      = "${var.cluster_name}-github-actions-role"
+    Project   = var.cluster_name
+    ManagedBy = "terraform"
   }
 }
 
 # IAM Policy for GitHub Actions - Terraform State Management
 resource "aws_iam_policy" "github_actions_terraform" {
-  name        = "${var.cluster_name}-github-actions-terraform-policy"
+  name        = "${var.cluster_name}-terraform-state-policy"
   description = "Policy for GitHub Actions to manage Terraform state"
 
   policy = jsonencode({
@@ -60,7 +71,9 @@ resource "aws_iam_policy" "github_actions_terraform" {
           "s3:GetObject",
           "s3:PutObject",
           "s3:DeleteObject",
-          "s3:ListBucket"
+          "s3:ListBucket",
+          "s3:GetBucketVersioning",
+          "s3:GetBucketLocation"
         ]
         Resource = [
           aws_s3_bucket.terraform_state.arn,
@@ -79,12 +92,18 @@ resource "aws_iam_policy" "github_actions_terraform" {
       }
     ]
   })
+
+  tags = {
+    Name      = "${var.cluster_name}-terraform-state-policy"
+    Project   = var.cluster_name
+    ManagedBy = "terraform"
+  }
 }
 
-# IAM Policy for GitHub Actions - EKS Management
+# IAM Policy for GitHub Actions - EKS Management (comprehensive)
 resource "aws_iam_policy" "github_actions_eks" {
-  name        = "${var.cluster_name}-github-actions-eks-policy"
-  description = "Policy for GitHub Actions to manage EKS resources"
+  name        = "${var.cluster_name}-eks-management-policy"
+  description = "Comprehensive policy for GitHub Actions to manage EKS resources"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -92,16 +111,56 @@ resource "aws_iam_policy" "github_actions_eks" {
       {
         Effect = "Allow"
         Action = [
+          # EKS permissions
           "eks:*",
+          
+          # EC2 permissions for EKS
           "ec2:*",
-          "iam:*",
+          
+          # IAM permissions for EKS roles
+          "iam:CreateRole",
+          "iam:DeleteRole",
+          "iam:GetRole",
+          "iam:ListRoles",
+          "iam:UpdateRole",
+          "iam:TagRole",
+          "iam:UntagRole",
+          "iam:CreatePolicy",
+          "iam:DeletePolicy",
+          "iam:GetPolicy",
+          "iam:ListPolicies",
+          "iam:AttachRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:ListAttachedRolePolicies",
+          "iam:PassRole",
+          "iam:CreateOpenIDConnectProvider",
+          "iam:GetOpenIDConnectProvider",
+          "iam:ListOpenIDConnectProviders",
+          "iam:TagOpenIDConnectProvider",
+          
+          # CloudWatch Logs
           "logs:*",
+          
+          # CloudWatch
           "cloudwatch:*",
+          
+          # Auto Scaling
           "autoscaling:*",
+          
+          # Elastic Load Balancing
           "elasticloadbalancing:*",
+          
+          # ECR
           "ecr:*",
+          
+          # STS
           "sts:GetCallerIdentity",
-          "kms:*"
+          
+          # KMS
+          "kms:CreateGrant",
+          "kms:DescribeKey",
+          "kms:List*",
+          "kms:Get*"
         ]
         Resource = "*"
       },
@@ -122,14 +181,21 @@ resource "aws_iam_policy" "github_actions_eks" {
       }
     ]
   })
+
+  tags = {
+    Name      = "${var.cluster_name}-eks-management-policy"
+    Project   = var.cluster_name
+    ManagedBy = "terraform"
+  }
 }
 
-# Attach policies to GitHub Actions role
+# Attach Terraform state policy to GitHub Actions role
 resource "aws_iam_role_policy_attachment" "github_actions_terraform" {
   role       = aws_iam_role.github_actions.name
   policy_arn = aws_iam_policy.github_actions_terraform.arn
 }
 
+# Attach EKS management policy to GitHub Actions role
 resource "aws_iam_role_policy_attachment" "github_actions_eks" {
   role       = aws_iam_role.github_actions.name
   policy_arn = aws_iam_policy.github_actions_eks.arn
@@ -139,4 +205,10 @@ resource "aws_iam_role_policy_attachment" "github_actions_eks" {
 output "github_actions_role_arn" {
   description = "ARN of the IAM role for GitHub Actions"
   value       = aws_iam_role.github_actions.arn
+}
+
+# Output the OIDC provider ARN
+output "github_oidc_provider_arn" {
+  description = "ARN of the GitHub OIDC provider"
+  value       = aws_iam_openid_connect_provider.github.arn
 }
