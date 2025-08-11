@@ -74,6 +74,9 @@ jobs:
       run: |
         terraform plan \
           -target=aws_s3_bucket.terraform_state \
+          -target=aws_s3_bucket_versioning.terraform_state \
+          -target=aws_s3_bucket_encryption.terraform_state \
+          -target=aws_s3_bucket_public_access_block.terraform_state \
           -target=aws_dynamodb_table.terraform_locks \
           -target=random_id.bucket_suffix \
           -out=bootstrap.tfplan \
@@ -83,27 +86,29 @@ jobs:
     - name: Terraform Apply (Bootstrap)
       if: |
         (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
-        (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
       id: apply-bootstrap
-      run: terraform apply bootstrap.tfplan
+      run: terraform apply -auto-approve bootstrap.tfplan
 
     - name: Get Backend Configuration
-      if: steps.apply-bootstrap.outcome == 'success' || steps.plan-bootstrap.outcome == 'success'
+      if: steps.apply-bootstrap.outcome == 'success'
       id: backend-config
       run: |
-        if [[ "${{ steps.apply-bootstrap.outcome }}" == "success" ]]; then
-          BUCKET_NAME=$(terraform output -raw terraform_state_bucket_name)
-          DYNAMODB_TABLE=$(terraform output -raw terraform_locks_table_name)
-        else
-          # For plan-only runs, extract from the plan
-          BUCKET_NAME="${{ vars.CLUSTER_NAME }}-terraform-state-$(openssl rand -hex 4)"
-          DYNAMODB_TABLE="${{ vars.CLUSTER_NAME }}-terraform-locks"
-        fi
+        # Get bucket and table names from Terraform outputs
+        BUCKET_NAME=$(terraform output -raw terraform_state_bucket_name)
+        DYNAMODB_TABLE=$(terraform output -raw terraform_locks_table_name)
         
         echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
         echo "dynamodb_table=$DYNAMODB_TABLE" >> $GITHUB_OUTPUT
         
-        # Create backend config file
+        echo "📦 Using S3 bucket: $BUCKET_NAME"
+        echo "🔒 Using DynamoDB table: $DYNAMODB_TABLE"
+        
+        # Remove any existing backend configuration
+        rm -f backend.tf
+        
+        # Create new backend config file
         cat > backend.tf << EOF
         terraform {
           backend "s3" {
@@ -115,19 +120,26 @@ jobs:
           }
         }
         EOF
+        
+        echo "✅ Backend configuration created"
+        cat backend.tf
 
     - name: Terraform Init (With Backend)
+      if: steps.backend-config.outcome == 'success'
       id: init
       run: |
+        echo "🔄 Initializing Terraform with S3 backend..."
         terraform init \
           -migrate-state \
           -force-copy
 
     - name: Terraform Validate
+      if: steps.init.outcome == 'success'
       id: validate
       run: terraform validate
 
     - name: Terraform Plan
+      if: steps.validate.outcome == 'success'
       id: plan
       run: |
         ACTION="${{ github.event.inputs.action || 'plan' }}"
@@ -174,25 +186,25 @@ jobs:
 
     - name: Terraform Apply
       if: |
-        (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
-        (github.event_name == 'workflow_dispatch' && 
-         (github.event.inputs.action == 'apply' || github.event.inputs.action == 'plan-destroy'))
+        steps.plan.outcome == 'success' &&
+        ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'))
       run: terraform apply -auto-approve tfplan
 
     - name: Generate Kubeconfig
       if: |
+        steps.plan.outcome == 'success' &&
         ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
-         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')) &&
-        github.event.inputs.action != 'plan-destroy'
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'))
       run: |
         terraform output -raw kubeconfig > kubeconfig
         echo "Kubeconfig generated successfully"
 
     - name: Upload Kubeconfig Artifact
       if: |
+        steps.plan.outcome == 'success' &&
         ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
-         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')) &&
-        github.event.inputs.action != 'plan-destroy'
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'))
       uses: actions/upload-artifact@v4
       with:
         name: kubeconfig-${{ github.run_id }}
@@ -201,9 +213,9 @@ jobs:
 
     - name: Test EKS Connection
       if: |
+        steps.plan.outcome == 'success' &&
         ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
-         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')) &&
-        github.event.inputs.action != 'plan-destroy'
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'))
       run: |
         # Install kubectl
         curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
@@ -230,6 +242,8 @@ jobs:
         echo "- **Validation**: ${{ steps.validate.outcome }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Plan**: ${{ steps.plan.outcome }}" >> $GITHUB_STEP_SUMMARY
         
-        if [[ "${{ steps.apply-bootstrap.outcome }}" == "success" ]] || [[ "${{ github.event.inputs.action }}" == "apply" ]]; then
-          echo "- **Apply**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+        if [[ "${{ steps.apply-bootstrap.outcome }}" == "success" ]]; then
+          echo "- **Bootstrap**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+          echo "- **S3 Bucket**: ${{ steps.backend-config.outputs.bucket_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **DynamoDB Table**: ${{ steps.backend-config.outputs.dynamodb_table }}" >> $GITHUB_STEP_SUMMARY
         fi
