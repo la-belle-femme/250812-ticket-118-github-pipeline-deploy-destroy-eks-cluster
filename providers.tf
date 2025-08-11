@@ -1,6 +1,6 @@
 terraform {
   required_version = ">= 1.0"
-  
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -17,13 +17,13 @@ terraform {
 
 provider "aws" {
   region = var.aws_region
-  
+
   default_tags {
     tags = merge(var.tags, {
-      Environment   = "development"
-      Project       = "EKS-GitHub-Actions"
-      ManagedBy     = "Terraform"
-      Repository    = var.github_repo
+      Environment = "development"
+      Project     = "EKS-GitHub-Actions"
+      ManagedBy   = "Terraform"
+      Repository  = var.github_repo
     })
   }
 }
@@ -38,7 +38,7 @@ data "aws_subnets" "existing" {
     name   = "vpc-id"
     values = [var.vpc_id]
   }
-  
+
   filter {
     name   = "subnet-id"
     values = var.subnet_ids
