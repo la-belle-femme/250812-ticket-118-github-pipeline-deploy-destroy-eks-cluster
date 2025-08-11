@@ -50,9 +50,9 @@ resource "aws_dynamodb_table" "terraform_locks" {
   }
 }
 
-# IAM role for EKS cluster
+# IAM role for EKS cluster (SHORT NAME)
 resource "aws_iam_role" "eks_cluster" {
-  name = "${var.cluster_name}-cluster-role"
+  name = "eks-cluster-${random_id.bucket_suffix.hex}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -79,15 +79,15 @@ resource "aws_iam_role_policy_attachment" "eks_vpc_resource_controller" {
   role       = aws_iam_role.eks_cluster.name
 }
 
-# CloudWatch log group for EKS cluster logs
+# CloudWatch log group for EKS cluster logs (SHORT NAME)
 resource "aws_cloudwatch_log_group" "eks_cluster" {
-  name              = "/aws/eks/${var.cluster_name}/cluster"
+  name              = "/aws/eks/eks-cluster-${random_id.bucket_suffix.hex}/cluster"
   retention_in_days = 7
 }
 
-# Security group for EKS cluster
+# Security group for EKS cluster (SHORT NAME)
 resource "aws_security_group" "eks_cluster" {
-  name_prefix = "${var.cluster_name}-cluster-sg"
+  name_prefix = "eks-cluster-${random_id.bucket_suffix.hex}-sg"
   vpc_id      = var.vpc_id
 
   ingress {
@@ -106,13 +106,13 @@ resource "aws_security_group" "eks_cluster" {
   }
 
   tags = {
-    Name = "${var.cluster_name}-cluster-sg"
+    Name = "eks-cluster-${random_id.bucket_suffix.hex}-sg"
   }
 }
 
-# EKS Cluster
+# EKS Cluster (SHORT NAME)
 resource "aws_eks_cluster" "main" {
-  name     = var.cluster_name
+  name     = "eks-cluster-${random_id.bucket_suffix.hex}"
   version  = var.cluster_version
   role_arn = aws_iam_role.eks_cluster.arn
 
@@ -132,9 +132,9 @@ resource "aws_eks_cluster" "main" {
   ]
 }
 
-# IAM role for EKS node group
+# IAM role for EKS node group (SHORT NAME)
 resource "aws_iam_role" "eks_node_group" {
-  name = "${var.cluster_name}-node-group-role"
+  name = "eks-nodes-${random_id.bucket_suffix.hex}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -166,9 +166,9 @@ resource "aws_iam_role_policy_attachment" "eks_container_registry_policy" {
   role       = aws_iam_role.eks_node_group.name
 }
 
-# Security group for EKS node group
+# Security group for EKS node group (SHORT NAME)
 resource "aws_security_group" "eks_nodes" {
-  name_prefix = "${var.cluster_name}-node-sg"
+  name_prefix = "eks-nodes-${random_id.bucket_suffix.hex}-sg"
   vpc_id      = var.vpc_id
 
   ingress {
@@ -195,8 +195,8 @@ resource "aws_security_group" "eks_nodes" {
   }
 
   tags = {
-    Name = "${var.cluster_name}-node-sg"
-    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    Name = "eks-nodes-${random_id.bucket_suffix.hex}-sg"
+    "kubernetes.io/cluster/eks-cluster-${random_id.bucket_suffix.hex}" = "owned"
   }
 }
 
@@ -211,10 +211,10 @@ resource "aws_security_group_rule" "cluster_ingress_node_https" {
   type                     = "ingress"
 }
 
-# EKS Node Group
+# EKS Node Group (SHORT NAME)
 resource "aws_eks_node_group" "main" {
   cluster_name    = aws_eks_cluster.main.name
-  node_group_name = "${var.cluster_name}-node-group"
+  node_group_name = "eks-nodes-${random_id.bucket_suffix.hex}"
   node_role_arn   = aws_iam_role.eks_node_group.arn
   subnet_ids      = var.subnet_ids
   instance_types  = var.instance_types
@@ -241,8 +241,8 @@ resource "aws_eks_node_group" "main" {
   ]
 
   tags = {
-    Name = "${var.cluster_name}-node-group"
-    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    Name = "eks-nodes-${random_id.bucket_suffix.hex}"
+    "kubernetes.io/cluster/eks-cluster-${random_id.bucket_suffix.hex}" = "owned"
   }
 }
 
@@ -257,6 +257,6 @@ resource "aws_iam_openid_connect_provider" "eks" {
   url             = aws_eks_cluster.main.identity[0].oidc[0].issuer
 
   tags = {
-    Name = "${var.cluster_name}-eks-irsa"
+    Name = "eks-irsa-${random_id.bucket_suffix.hex}"
   }
 }

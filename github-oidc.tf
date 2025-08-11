@@ -1,31 +1,9 @@
-# GitHub OIDC Provider for AWS (creates if doesn't exist)
-resource "aws_iam_openid_connect_provider" "github" {
+# Use existing GitHub OIDC Provider (data source only - no creation)
+data "aws_iam_openid_connect_provider" "github" {
   url = "https://token.actions.githubusercontent.com"
-
-  client_id_list = [
-    "sts.amazonaws.com",
-  ]
-
-  thumbprint_list = [
-    "6938fd4d98bab03faadb97b34396831e3780aea1",
-    "1c58a3a8518e8759bf075b76b750d4f2df264fcd"
-  ]
-
-  tags = {
-    Name        = "github-oidc-provider"
-    Environment = "shared"
-    ManagedBy   = "terraform"
-  }
-
-  lifecycle {
-    ignore_changes = [
-      thumbprint_list,
-      client_id_list
-    ]
-  }
 }
 
-# IAM Role for GitHub Actions (short unique name)
+# IAM Role for GitHub Actions (short unique name to avoid conflicts)
 resource "aws_iam_role" "github_actions" {
   name = "eks-gh-actions-${random_id.bucket_suffix.hex}"
 
@@ -35,7 +13,7 @@ resource "aws_iam_role" "github_actions" {
       {
         Effect = "Allow"
         Principal = {
-          Federated = aws_iam_openid_connect_provider.github.arn
+          Federated = data.aws_iam_openid_connect_provider.github.arn
         }
         Action = "sts:AssumeRoleWithWebIdentity"
         Condition = {
@@ -52,7 +30,7 @@ resource "aws_iam_role" "github_actions" {
 
   tags = {
     Name      = "eks-gh-actions-${random_id.bucket_suffix.hex}"
-    Project   = var.cluster_name
+    Project   = "eks-cluster"
     ManagedBy = "terraform"
   }
 }
@@ -95,12 +73,11 @@ resource "aws_iam_policy" "github_actions_terraform" {
 
   tags = {
     Name      = "eks-tf-state-${random_id.bucket_suffix.hex}"
-    Project   = var.cluster_name
     ManagedBy = "terraform"
   }
 }
 
-# IAM Policy for GitHub Actions - EKS Management (comprehensive)
+# IAM Policy for GitHub Actions - EKS Management
 resource "aws_iam_policy" "github_actions_eks" {
   name        = "eks-mgmt-${random_id.bucket_suffix.hex}"
   description = "Comprehensive policy for GitHub Actions to manage EKS resources"
@@ -111,13 +88,8 @@ resource "aws_iam_policy" "github_actions_eks" {
       {
         Effect = "Allow"
         Action = [
-          # EKS permissions
           "eks:*",
-          
-          # EC2 permissions for EKS
           "ec2:*",
-          
-          # IAM permissions for EKS roles
           "iam:CreateRole",
           "iam:DeleteRole",
           "iam:GetRole",
@@ -137,26 +109,12 @@ resource "aws_iam_policy" "github_actions_eks" {
           "iam:GetOpenIDConnectProvider",
           "iam:ListOpenIDConnectProviders",
           "iam:TagOpenIDConnectProvider",
-          
-          # CloudWatch Logs
           "logs:*",
-          
-          # CloudWatch
           "cloudwatch:*",
-          
-          # Auto Scaling
           "autoscaling:*",
-          
-          # Elastic Load Balancing
           "elasticloadbalancing:*",
-          
-          # ECR
           "ecr:*",
-          
-          # STS
           "sts:GetCallerIdentity",
-          
-          # KMS
           "kms:CreateGrant",
           "kms:DescribeKey",
           "kms:List*",
@@ -184,7 +142,6 @@ resource "aws_iam_policy" "github_actions_eks" {
 
   tags = {
     Name      = "eks-mgmt-${random_id.bucket_suffix.hex}"
-    Project   = var.cluster_name
     ManagedBy = "terraform"
   }
 }
@@ -207,8 +164,8 @@ output "github_actions_role_arn" {
   value       = aws_iam_role.github_actions.arn
 }
 
-# Output the OIDC provider ARN
+# Output the OIDC provider ARN  
 output "github_oidc_provider_arn" {
   description = "ARN of the GitHub OIDC provider"
-  value       = aws_iam_openid_connect_provider.github.arn
+  value       = data.aws_iam_openid_connect_provider.github.arn
 }
