@@ -1,0 +1,235 @@
+name: Deploy EKS Cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+        - plan
+        - apply
+        - plan-destroy
+  push:
+    branches:
+      - main
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/deploy-eks.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+
+env:
+  TF_VERSION: "1.9.5"
+  AWS_REGION: "us-east-1"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  terraform:
+    name: "Terraform ${{ github.event.inputs.action || 'plan' }}"
+    runs-on: ubuntu-latest
+    environment: 
+      name: development
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        role-session-name: GitHubActions-${{ github.run_id }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform-version: ${{ env.TF_VERSION }}
+
+    - name: Terraform Format Check
+      id: fmt
+      run: terraform fmt -check -recursive
+      continue-on-error: true
+
+    - name: Terraform Init (Bootstrap)
+      id: init-bootstrap
+      run: |
+        terraform init \
+          -backend=false
+
+    - name: Terraform Plan (Bootstrap)
+      id: plan-bootstrap
+      run: |
+        terraform plan \
+          -target=aws_s3_bucket.terraform_state \
+          -target=aws_dynamodb_table.terraform_locks \
+          -target=random_id.bucket_suffix \
+          -out=bootstrap.tfplan \
+          -detailed-exitcode
+      continue-on-error: true
+
+    - name: Terraform Apply (Bootstrap)
+      if: |
+        (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+      id: apply-bootstrap
+      run: terraform apply bootstrap.tfplan
+
+    - name: Get Backend Configuration
+      if: steps.apply-bootstrap.outcome == 'success' || steps.plan-bootstrap.outcome == 'success'
+      id: backend-config
+      run: |
+        if [[ "${{ steps.apply-bootstrap.outcome }}" == "success" ]]; then
+          BUCKET_NAME=$(terraform output -raw terraform_state_bucket_name)
+          DYNAMODB_TABLE=$(terraform output -raw terraform_locks_table_name)
+        else
+          # For plan-only runs, extract from the plan
+          BUCKET_NAME="${{ vars.CLUSTER_NAME }}-terraform-state-$(openssl rand -hex 4)"
+          DYNAMODB_TABLE="${{ vars.CLUSTER_NAME }}-terraform-locks"
+        fi
+        
+        echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+        echo "dynamodb_table=$DYNAMODB_TABLE" >> $GITHUB_OUTPUT
+        
+        # Create backend config file
+        cat > backend.tf << EOF
+        terraform {
+          backend "s3" {
+            bucket         = "$BUCKET_NAME"
+            key            = "terraform.tfstate"
+            region         = "${{ env.AWS_REGION }}"
+            dynamodb_table = "$DYNAMODB_TABLE"
+            encrypt        = true
+          }
+        }
+        EOF
+
+    - name: Terraform Init (With Backend)
+      id: init
+      run: |
+        terraform init \
+          -migrate-state \
+          -force-copy
+
+    - name: Terraform Validate
+      id: validate
+      run: terraform validate
+
+    - name: Terraform Plan
+      id: plan
+      run: |
+        ACTION="${{ github.event.inputs.action || 'plan' }}"
+        if [[ "$ACTION" == "plan-destroy" ]]; then
+          terraform plan -destroy -out=tfplan -detailed-exitcode
+        else
+          terraform plan -out=tfplan -detailed-exitcode
+        fi
+      continue-on-error: true
+
+    - name: Update Pull Request
+      uses: actions/github-script@v7
+      if: github.event_name == 'pull_request'
+      env:
+        PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+          #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+          <details><summary>Show Plan</summary>
+
+          \`\`\`\n
+          ${process.env.PLAN}
+          \`\`\`
+
+          </details>
+
+          *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          })
+
+    - name: Terraform Plan Status
+      if: steps.plan.outcome == 'failure'
+      run: exit 1
+
+    - name: Terraform Apply
+      if: |
+        (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+        (github.event_name == 'workflow_dispatch' && 
+         (github.event.inputs.action == 'apply' || github.event.inputs.action == 'plan-destroy'))
+      run: terraform apply -auto-approve tfplan
+
+    - name: Generate Kubeconfig
+      if: |
+        ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')) &&
+        github.event.inputs.action != 'plan-destroy'
+      run: |
+        terraform output -raw kubeconfig > kubeconfig
+        echo "Kubeconfig generated successfully"
+
+    - name: Upload Kubeconfig Artifact
+      if: |
+        ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')) &&
+        github.event.inputs.action != 'plan-destroy'
+      uses: actions/upload-artifact@v4
+      with:
+        name: kubeconfig-${{ github.run_id }}
+        path: kubeconfig
+        retention-days: 7
+
+    - name: Test EKS Connection
+      if: |
+        ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')) &&
+        github.event.inputs.action != 'plan-destroy'
+      run: |
+        # Install kubectl
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+        
+        # Set kubeconfig
+        export KUBECONFIG=./kubeconfig
+        
+        # Test connection
+        kubectl cluster-info
+        kubectl get nodes
+        
+        echo "✅ EKS cluster is accessible and nodes are ready!"
+
+    - name: Summary
+      run: |
+        echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Action**: ${{ github.event.inputs.action || 'plan' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Terraform Version**: ${{ env.TF_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **AWS Region**: ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cluster Name**: ${{ vars.CLUSTER_NAME || 'eks-cluster' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Format Check**: ${{ steps.fmt.outcome }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Validation**: ${{ steps.validate.outcome }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Plan**: ${{ steps.plan.outcome }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ "${{ steps.apply-bootstrap.outcome }}" == "success" ]] || [[ "${{ github.event.inputs.action }}" == "apply" ]]; then
+          echo "- **Apply**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+        fi
