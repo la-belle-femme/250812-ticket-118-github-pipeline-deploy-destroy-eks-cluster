@@ -62,26 +62,25 @@ jobs:
     - name: Get Backend Configuration
       id: backend-config
       run: |
-        # Try to get backend configuration from existing state or use defaults
-        CLUSTER_NAME="${{ vars.CLUSTER_NAME }}"
-        if [[ -z "$CLUSTER_NAME" ]]; then
-          CLUSTER_NAME="250812-ticket-118-github-action-eks-cluster"
-        fi
+        # Use the exact bucket name we know exists
+        BUCKET_NAME="eks-tfstate-us-east-1-d91584e3"
+        DYNAMODB_TABLE="eks-tfstate-locks-d91584e3"
         
-        # Look for existing S3 buckets with our naming pattern
-        BUCKET_NAME=$(aws s3api list-buckets --query "Buckets[?contains(Name, '$CLUSTER_NAME-terraform-state')].Name" --output text | head -1)
+        # Verify bucket exists and has state file
+        echo "📦 Checking S3 bucket: $BUCKET_NAME"
+        aws s3 ls s3://$BUCKET_NAME/terraform.tfstate
         
-        if [[ -z "$BUCKET_NAME" ]]; then
-          echo "❌ No Terraform state bucket found. Cluster may already be destroyed."
+        if [ $? -eq 0 ]; then
+          echo "✅ Found Terraform state file"
+        else
+          echo "❌ No state file found in bucket"
           exit 1
         fi
-        
-        DYNAMODB_TABLE="$CLUSTER_NAME-terraform-locks"
         
         echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
         echo "dynamodb_table=$DYNAMODB_TABLE" >> $GITHUB_OUTPUT
         
-        echo "📦 Found state bucket: $BUCKET_NAME"
+        echo "📦 Using S3 bucket: $BUCKET_NAME"
         echo "🔒 Using DynamoDB table: $DYNAMODB_TABLE"
         
         # Create backend config file
@@ -96,6 +95,9 @@ jobs:
           }
         }
         EOF
+        
+        echo "✅ Backend configuration created"
+        cat backend.tf
 
     - name: Terraform Init
       id: init
@@ -106,6 +108,7 @@ jobs:
       id: plan-destroy-eks
       run: |
         terraform plan -destroy \
+          -var-file="terraform.tfvars" \
           -target=aws_eks_node_group.main \
           -target=aws_eks_cluster.main \
           -target=aws_iam_openid_connect_provider.eks \
@@ -129,6 +132,7 @@ jobs:
       id: plan-destroy-all
       run: |
         terraform plan -destroy \
+          -var-file="terraform.tfvars" \
           -out=destroy-all.tfplan \
           -detailed-exitcode
       continue-on-error: true
@@ -206,7 +210,7 @@ jobs:
         echo "## 🔍 DESTRUCTION VERIFICATION" >> $GITHUB_STEP_SUMMARY
         
         # Check if EKS cluster still exists
-        CLUSTER_NAME="${{ vars.CLUSTER_NAME || '250812-ticket-118-github-action-eks-cluster' }}"
+        CLUSTER_NAME="eks-cluster-d91584e3"
         if aws eks describe-cluster --name "$CLUSTER_NAME" --region ${{ env.AWS_REGION }} 2>/dev/null; then
           echo "❌ EKS cluster still exists!" >> $GITHUB_STEP_SUMMARY
           exit 1
