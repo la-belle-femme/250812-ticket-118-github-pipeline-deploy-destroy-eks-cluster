@@ -15,7 +15,7 @@ resource "aws_s3_bucket_versioning" "terraform_state" {
   }
 }
 
-resource "aws_s3_bucket_encryption" "terraform_state" {
+resource "aws_s3_bucket_server_side_encryption_configuration" "terraform_state" {
   bucket = aws_s3_bucket.terraform_state.id
 
   rule {
@@ -36,9 +36,9 @@ resource "aws_s3_bucket_public_access_block" "terraform_state" {
 
 # DynamoDB table for Terraform state locking
 resource "aws_dynamodb_table" "terraform_locks" {
-  name         = "${var.cluster_name}-terraform-locks"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "LockID"
+  name           = "${var.cluster_name}-terraform-locks"
+  billing_mode   = "PAY_PER_REQUEST"
+  hash_key       = "LockID"
 
   attribute {
     name = "LockID"
@@ -195,7 +195,7 @@ resource "aws_security_group" "eks_nodes" {
   }
 
   tags = {
-    Name                                        = "${var.cluster_name}-node-sg"
+    Name = "${var.cluster_name}-node-sg"
     "kubernetes.io/cluster/${var.cluster_name}" = "owned"
   }
 }
@@ -230,7 +230,7 @@ resource "aws_eks_node_group" "main" {
   }
 
   remote_access {
-    ec2_ssh_key               = var.key_pair_name
+    ec2_ssh_key = var.key_pair_name
     source_security_group_ids = [aws_security_group.eks_nodes.id]
   }
 
@@ -241,7 +241,7 @@ resource "aws_eks_node_group" "main" {
   ]
 
   tags = {
-    Name                                        = "${var.cluster_name}-node-group"
+    Name = "${var.cluster_name}-node-group"
     "kubernetes.io/cluster/${var.cluster_name}" = "owned"
   }
 }
