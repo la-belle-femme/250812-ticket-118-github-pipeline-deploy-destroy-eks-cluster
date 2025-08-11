@@ -25,9 +25,9 @@ resource "aws_iam_openid_connect_provider" "github" {
   }
 }
 
-# IAM Role for GitHub Actions (unique per project)
+# IAM Role for GitHub Actions (short unique name)
 resource "aws_iam_role" "github_actions" {
-  name = "${var.cluster_name}-github-actions-role"
+  name = "eks-gh-actions-${random_id.bucket_suffix.hex}"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -51,7 +51,7 @@ resource "aws_iam_role" "github_actions" {
   })
 
   tags = {
-    Name      = "${var.cluster_name}-github-actions-role"
+    Name      = "eks-gh-actions-${random_id.bucket_suffix.hex}"
     Project   = var.cluster_name
     ManagedBy = "terraform"
   }
@@ -59,7 +59,7 @@ resource "aws_iam_role" "github_actions" {
 
 # IAM Policy for GitHub Actions - Terraform State Management
 resource "aws_iam_policy" "github_actions_terraform" {
-  name        = "${var.cluster_name}-terraform-state-policy"
+  name        = "eks-tf-state-${random_id.bucket_suffix.hex}"
   description = "Policy for GitHub Actions to manage Terraform state"
 
   policy = jsonencode({
@@ -94,7 +94,7 @@ resource "aws_iam_policy" "github_actions_terraform" {
   })
 
   tags = {
-    Name      = "${var.cluster_name}-terraform-state-policy"
+    Name      = "eks-tf-state-${random_id.bucket_suffix.hex}"
     Project   = var.cluster_name
     ManagedBy = "terraform"
   }
@@ -102,7 +102,7 @@ resource "aws_iam_policy" "github_actions_terraform" {
 
 # IAM Policy for GitHub Actions - EKS Management (comprehensive)
 resource "aws_iam_policy" "github_actions_eks" {
-  name        = "${var.cluster_name}-eks-management-policy"
+  name        = "eks-mgmt-${random_id.bucket_suffix.hex}"
   description = "Comprehensive policy for GitHub Actions to manage EKS resources"
 
   policy = jsonencode({
@@ -183,7 +183,7 @@ resource "aws_iam_policy" "github_actions_eks" {
   })
 
   tags = {
-    Name      = "${var.cluster_name}-eks-management-policy"
+    Name      = "eks-mgmt-${random_id.bucket_suffix.hex}"
     Project   = var.cluster_name
     ManagedBy = "terraform"
   }
