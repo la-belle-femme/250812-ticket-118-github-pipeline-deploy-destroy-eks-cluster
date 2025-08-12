@@ -1,14 +1,3 @@
-# Force a new random suffix to ensure we get updated permissions
-# resource "random_id" "bucket_suffix" {
-#   byte_length = 4
-  
-#   keepers = {
-#     # Changed this to force recreation with new permissions
-#     timestamp = "2025-08-12-v3"
-#   }
-# }
-
-# Use existing GitHub OIDC Provider (data source only - no creation)
 # Use existing GitHub OIDC Provider (data source only - no creation)
 data "aws_iam_openid_connect_provider" "github" {
   url = "https://token.actions.githubusercontent.com"
@@ -46,7 +35,7 @@ resource "aws_iam_role" "github_actions" {
   }
 }
 
-# UPDATED IAM Policy for GitHub Actions - Terraform State Management with CREATE permissions
+# IAM Policy for GitHub Actions - Terraform State Management with CREATE permissions
 resource "aws_iam_policy" "github_actions_terraform" {
   name        = "eks-tf-state-${random_id.bucket_suffix.hex}"
   description = "Policy for GitHub Actions to manage Terraform state with CREATE permissions"
@@ -115,12 +104,6 @@ resource "aws_iam_policy" "github_actions_terraform" {
       }
     ]
   })
-
-  # Tags removed to avoid iam:TagPolicy permission requirement
-  # tags = {
-  #   Name      = "eks-tf-state-${random_id.bucket_suffix.hex}"
-  #   ManagedBy = "terraform"
-  # }
 }
 
 # IAM Policy for GitHub Actions - EKS Management
@@ -185,12 +168,6 @@ resource "aws_iam_policy" "github_actions_eks" {
       }
     ]
   })
-
-  # Tags removed to avoid iam:TagPolicy permission requirement
-  # tags = {
-  #   Name      = "eks-mgmt-${random_id.bucket_suffix.hex}"
-  #   ManagedBy = "terraform"
-  # }
 }
 
 # Attach Terraform state policy to GitHub Actions role
