@@ -1,12 +1,12 @@
 # Force a new random suffix to ensure we get updated permissions
-resource "random_id" "bucket_suffix" {
-  byte_length = 4
+# resource "random_id" "bucket_suffix" {
+#   byte_length = 4
   
-  keepers = {
-    # Changed this to force recreation with new permissions
-    timestamp = "2025-08-12-v3"
-  }
-}
+#   keepers = {
+#     # Changed this to force recreation with new permissions
+#     timestamp = "2025-08-12-v3"
+#   }
+# }
 
 # Use existing GitHub OIDC Provider (data source only - no creation)
 data "aws_iam_openid_connect_provider" "github" {
