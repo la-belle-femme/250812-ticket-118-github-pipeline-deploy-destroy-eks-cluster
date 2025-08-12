@@ -1,0 +1,536 @@
+name: EKS Cluster Management
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+        - plan
+        - apply
+        - plan-destroy
+        - destroy
+      confirm_destroy:
+        description: 'Type "DESTROY" to confirm cluster destruction (required for destroy action)'
+        required: false
+        type: string
+      destroy_backend:
+        description: 'Also destroy S3 bucket and DynamoDB table (WARNING: This will delete state)'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/unified-eks-workflow.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+
+env:
+  TF_VERSION: "1.9.5"
+  AWS_REGION: "us-east-1"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  actions: write
+
+jobs:
+  validate-destroy-input:
+    name: "Validate Destruction Input"
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action == 'destroy'
+    steps:
+    - name: Validate Confirmation
+      run: |
+        if [[ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]]; then
+          echo "❌ Destruction not confirmed. You must type 'DESTROY' to proceed."
+          echo "You typed: '${{ github.event.inputs.confirm_destroy }}'"
+          exit 1
+        fi
+        echo "✅ Destruction confirmed"
+
+  terraform:
+    name: "EKS Management - ${{ github.event.inputs.action || 'plan' }}"
+    runs-on: ubuntu-latest
+    needs: [validate-destroy-input]
+    if: always() && (needs.validate-destroy-input.result == 'success' || needs.validate-destroy-input.result == 'skipped')
+    environment: 
+      name: development
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+        role-session-name: GitHubActions-${{ github.event.inputs.action || 'plan' }}-${{ github.run_id }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform-version: ${{ env.TF_VERSION }}
+
+    - name: Terraform Format Check
+      id: fmt
+      run: terraform fmt -check -recursive
+      continue-on-error: true
+
+    # DEPLOY LOGIC - Bootstrap Phase (Create GitHub Actions Role First)
+    - name: Terraform Init (Bootstrap)
+      if: github.event.inputs.action != 'destroy'
+      id: init-bootstrap
+      run: |
+        terraform init \
+          -backend=false
+
+    - name: Terraform Plan (GitHub OIDC Role)
+      if: github.event.inputs.action != 'destroy'
+      id: plan-github-oidc
+      run: |
+        # First create the GitHub Actions role with proper permissions
+        terraform plan \
+          -var-file="terraform.tfvars" \
+          -target=random_id.bucket_suffix \
+          -target=data.aws_iam_openid_connect_provider.github \
+          -target=aws_iam_role.github_actions \
+          -target=aws_iam_policy.github_actions_terraform \
+          -target=aws_iam_policy.github_actions_eks \
+          -target=aws_iam_role_policy_attachment.github_actions_terraform \
+          -target=aws_iam_role_policy_attachment.github_actions_eks \
+          -out=github-oidc.tfplan \
+          -detailed-exitcode
+      continue-on-error: true
+
+    - name: Terraform Apply (GitHub OIDC Role)
+      if: |
+        github.event.inputs.action != 'destroy' &&
+        ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan'))
+      id: apply-github-oidc
+      run: terraform apply -auto-approve github-oidc.tfplan
+
+    - name: Wait for IAM Role Propagation
+      if: steps.apply-github-oidc.outcome == 'success'
+      run: |
+        echo "⏳ Waiting for IAM role permissions to propagate..."
+        sleep 30
+
+    - name: Terraform Plan (Bootstrap)
+      if: github.event.inputs.action != 'destroy' && steps.apply-github-oidc.outcome == 'success'
+      id: plan-bootstrap
+      run: |
+        # Now create the S3 bucket and DynamoDB table with the updated permissions
+        terraform plan \
+          -var-file="terraform.tfvars" \
+          -target=aws_s3_bucket.terraform_state \
+          -target=aws_s3_bucket_versioning.terraform_state \
+          -target=aws_s3_bucket_server_side_encryption_configuration.terraform_state \
+          -target=aws_s3_bucket_public_access_block.terraform_state \
+          -target=aws_dynamodb_table.terraform_locks \
+          -out=bootstrap.tfplan \
+          -detailed-exitcode
+      continue-on-error: true
+
+    - name: Terraform Apply (Bootstrap)
+      if: |
+        github.event.inputs.action != 'destroy' &&
+        steps.plan-bootstrap.outcome == 'success' &&
+        ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan'))
+      id: apply-bootstrap
+      run: terraform apply -auto-approve bootstrap.tfplan
+
+    - name: Get Backend Configuration (Deploy)
+      if: github.event.inputs.action != 'destroy' && steps.apply-bootstrap.outcome == 'success'
+      id: backend-config-deploy
+      run: |
+        # Get bucket and table names from Terraform outputs
+        BUCKET_NAME=$(terraform output -raw terraform_state_bucket_name)
+        DYNAMODB_TABLE=$(terraform output -raw terraform_locks_table_name)
+        
+        echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+        echo "dynamodb_table=$DYNAMODB_TABLE" >> $GITHUB_OUTPUT
+        
+        echo "📦 Using S3 bucket: $BUCKET_NAME"
+        echo "🔒 Using DynamoDB table: $DYNAMODB_TABLE"
+        
+        # Remove any existing backend configuration
+        rm -f backend.tf
+        
+        # Create new backend config file
+        cat > backend.tf << EOF
+        terraform {
+          backend "s3" {
+            bucket         = "$BUCKET_NAME"
+            key            = "terraform.tfstate"
+            region         = "${{ env.AWS_REGION }}"
+            dynamodb_table = "$DYNAMODB_TABLE"
+            encrypt        = true
+          }
+        }
+        EOF
+        
+        echo "✅ Backend configuration created"
+        cat backend.tf
+
+    # DESTROY LOGIC - Backend Configuration
+    - name: Get Backend Configuration (Destroy)
+      if: github.event.inputs.action == 'destroy'
+      id: backend-config-destroy
+      run: |
+        # Use the exact bucket name we know exists
+        BUCKET_NAME="eks-tfstate-us-east-1-d91584e3"
+        DYNAMODB_TABLE="eks-tfstate-locks-d91584e3"
+        
+        # Verify bucket exists and has state file
+        echo "📦 Checking S3 bucket: $BUCKET_NAME"
+        aws s3 ls s3://$BUCKET_NAME/terraform.tfstate
+        
+        if [ $? -eq 0 ]; then
+          echo "✅ Found Terraform state file"
+        else
+          echo "❌ No state file found in bucket"
+          exit 1
+        fi
+        
+        echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
+        echo "dynamodb_table=$DYNAMODB_TABLE" >> $GITHUB_OUTPUT
+        
+        echo "📦 Using S3 bucket: $BUCKET_NAME"
+        echo "🔒 Using DynamoDB table: $DYNAMODB_TABLE"
+        
+        # Create backend config file
+        cat > backend.tf << EOF
+        terraform {
+          backend "s3" {
+            bucket         = "$BUCKET_NAME"
+            key            = "terraform.tfstate"
+            region         = "${{ env.AWS_REGION }}"
+            dynamodb_table = "$DYNAMODB_TABLE"
+            encrypt        = true
+          }
+        }
+        EOF
+        
+        echo "✅ Backend configuration created"
+        cat backend.tf
+
+    # COMMON INITIALIZATION
+    - name: Terraform Init (With Backend)
+      if: |
+        (github.event.inputs.action != 'destroy' && steps.backend-config-deploy.outcome == 'success') ||
+        (github.event.inputs.action == 'destroy')
+      id: init
+      run: |
+        echo "🔄 Initializing Terraform with S3 backend..."
+        if [[ "${{ github.event.inputs.action }}" == "destroy" ]]; then
+          terraform init
+        else
+          terraform init \
+            -migrate-state \
+            -force-copy
+        fi
+
+    - name: Terraform Validate
+      if: steps.init.outcome == 'success'
+      id: validate
+      run: terraform validate
+
+    # DEPLOY LOGIC - Planning and Application
+    - name: Terraform Plan (Deploy)
+      if: steps.validate.outcome == 'success' && github.event.inputs.action != 'destroy'
+      id: plan-deploy
+      run: |
+        ACTION="${{ github.event.inputs.action || 'plan' }}"
+        if [[ "$ACTION" == "plan-destroy" ]]; then
+          terraform plan -destroy -var-file="terraform.tfvars" -out=tfplan -detailed-exitcode
+        else
+          terraform plan -var-file="terraform.tfvars" -out=tfplan -detailed-exitcode
+        fi
+      continue-on-error: true
+
+    # DESTROY LOGIC - Planning
+    - name: Terraform Plan Destroy (EKS Resources Only)
+      if: github.event.inputs.action == 'destroy' && github.event.inputs.destroy_backend == 'false'
+      id: plan-destroy-eks
+      run: |
+        terraform plan -destroy \
+          -var-file="terraform.tfvars" \
+          -target=aws_eks_node_group.main \
+          -target=aws_eks_cluster.main \
+          -target=aws_iam_openid_connect_provider.eks \
+          -target=aws_security_group.eks_nodes \
+          -target=aws_security_group.eks_cluster \
+          -target=aws_security_group_rule.cluster_ingress_node_https \
+          -target=aws_iam_role_policy_attachment.eks_worker_node_policy \
+          -target=aws_iam_role_policy_attachment.eks_cni_policy \
+          -target=aws_iam_role_policy_attachment.eks_container_registry_policy \
+          -target=aws_iam_role_policy_attachment.eks_cluster_policy \
+          -target=aws_iam_role_policy_attachment.eks_vpc_resource_controller \
+          -target=aws_iam_role.eks_node_group \
+          -target=aws_iam_role.eks_cluster \
+          -target=aws_cloudwatch_log_group.eks_cluster \
+          -out=destroy-eks.tfplan \
+          -detailed-exitcode
+      continue-on-error: true
+
+    - name: Terraform Plan Destroy (All Resources)
+      if: github.event.inputs.action == 'destroy' && github.event.inputs.destroy_backend == 'true'
+      id: plan-destroy-all
+      run: |
+        terraform plan -destroy \
+          -var-file="terraform.tfvars" \
+          -out=destroy-all.tfplan \
+          -detailed-exitcode
+      continue-on-error: true
+
+    - name: Show Destruction Plan
+      if: github.event.inputs.action == 'destroy'
+      run: |
+        echo "## 🚨 DESTRUCTION PLAN" >> $GITHUB_STEP_SUMMARY
+        echo "The following resources will be **PERMANENTLY DELETED**:" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ "${{ github.event.inputs.destroy_backend }}" == "true" ]]; then
+          echo "### ⚠️ COMPLETE DESTRUCTION (INCLUDING STATE BACKEND)" >> $GITHUB_STEP_SUMMARY
+          echo "- EKS Cluster and all related resources" >> $GITHUB_STEP_SUMMARY
+          echo "- S3 Bucket (Terraform state) - **THIS CANNOT BE UNDONE**" >> $GITHUB_STEP_SUMMARY
+          echo "- DynamoDB Table (state locking)" >> $GITHUB_STEP_SUMMARY
+          echo "- All IAM roles and policies" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "### 🎯 EKS CLUSTER DESTRUCTION (PRESERVING STATE BACKEND)" >> $GITHUB_STEP_SUMMARY
+          echo "- EKS Cluster and Node Groups" >> $GITHUB_STEP_SUMMARY
+          echo "- Security Groups" >> $GITHUB_STEP_SUMMARY
+          echo "- IAM Roles and Policies (EKS-related)" >> $GITHUB_STEP_SUMMARY
+          echo "- CloudWatch Log Groups" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**PRESERVED:**" >> $GITHUB_STEP_SUMMARY
+          echo "- S3 Bucket (Terraform state)" >> $GITHUB_STEP_SUMMARY
+          echo "- DynamoDB Table (state locking)" >> $GITHUB_STEP_SUMMARY
+          echo "- GitHub OIDC configuration" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    # PULL REQUEST COMMENTS
+    - name: Update Pull Request
+      uses: actions/github-script@v7
+      if: github.event_name == 'pull_request'
+      env:
+        PLAN: "terraform\n${{ steps.plan-deploy.outputs.stdout }}"
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+          #### Terraform Plan 📖\`${{ steps.plan-deploy.outcome }}\`
+
+          <details><summary>Show Plan</summary>
+
+          \`\`\`\n
+          ${process.env.PLAN}
+          \`\`\`
+
+          </details>
+
+          *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: output
+          })
+
+    - name: Terraform Plan Status
+      if: steps.plan-deploy.outcome == 'failure'
+      run: exit 1
+
+    # DEPLOY LOGIC - Application
+    - name: Terraform Apply (Deploy)
+      if: |
+        github.event.inputs.action != 'destroy' &&
+        steps.plan-deploy.outcome == 'success' &&
+        ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'))
+      run: terraform apply -auto-approve tfplan
+
+    # DESTROY LOGIC - Application
+    - name: Terraform Destroy (EKS Resources Only)
+      if: |
+        github.event.inputs.action == 'destroy' &&
+        github.event.inputs.destroy_backend == 'false' &&
+        (steps.plan-destroy-eks.outcome == 'success' || steps.plan-destroy-eks.outputs.exitcode == '2')
+      run: |
+        echo "🚨 Starting EKS cluster destruction..."
+        terraform apply -auto-approve destroy-eks.tfplan
+        echo "✅ EKS cluster destroyed successfully!"
+
+    - name: Terraform Destroy (All Resources)
+      if: |
+        github.event.inputs.action == 'destroy' &&
+        github.event.inputs.destroy_backend == 'true' &&
+        (steps.plan-destroy-all.outcome == 'success' || steps.plan-destroy-all.outputs.exitcode == '2')
+      run: |
+        echo "🚨 Starting complete infrastructure destruction..."
+        terraform apply -auto-approve destroy-all.tfplan
+        echo "✅ All resources destroyed successfully!"
+
+    # POST-DEPLOY ACTIONS
+    - name: Generate Kubeconfig
+      if: |
+        github.event.inputs.action != 'destroy' &&
+        steps.plan-deploy.outcome == 'success' &&
+        ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'))
+      run: |
+        terraform output -raw kubeconfig > kubeconfig
+        echo "Kubeconfig generated successfully"
+
+    - name: Upload Kubeconfig Artifact
+      if: |
+        github.event.inputs.action != 'destroy' &&
+        steps.plan-deploy.outcome == 'success' &&
+        ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'))
+      uses: actions/upload-artifact@v4
+      with:
+        name: kubeconfig-${{ github.run_id }}
+        path: kubeconfig
+        retention-days: 7
+
+    - name: Test EKS Connection
+      if: |
+        github.event.inputs.action != 'destroy' &&
+        steps.plan-deploy.outcome == 'success' &&
+        ((github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'))
+      run: |
+        # Install kubectl
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+        
+        # Set kubeconfig
+        export KUBECONFIG=./kubeconfig
+        
+        # Test connection
+        kubectl cluster-info
+        kubectl get nodes
+        
+        echo "✅ EKS cluster is accessible and nodes are ready!"
+
+    # POST-DESTROY ACTIONS
+    - name: Cleanup State Bucket (if requested)
+      if: github.event.inputs.action == 'destroy' && github.event.inputs.destroy_backend == 'true'
+      run: |
+        BUCKET_NAME="${{ steps.backend-config-destroy.outputs.bucket_name }}"
+        echo "🧹 Cleaning up state bucket: $BUCKET_NAME"
+        
+        # Remove all objects from the bucket
+        aws s3 rm s3://$BUCKET_NAME --recursive || true
+        
+        # Remove all object versions (if versioning is enabled)
+        aws s3api list-object-versions --bucket $BUCKET_NAME --query 'Versions[].{Key:Key,VersionId:VersionId}' --output text | while read key version; do
+          if [[ -n "$key" && -n "$version" ]]; then
+            aws s3api delete-object --bucket $BUCKET_NAME --key "$key" --version-id "$version" || true
+          fi
+        done
+        
+        # Remove delete markers
+        aws s3api list-object-versions --bucket $BUCKET_NAME --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' --output text | while read key version; do
+          if [[ -n "$key" && -n "$version" ]]; then
+            aws s3api delete-object --bucket $BUCKET_NAME --key "$key" --version-id "$version" || true
+          fi
+        done
+        
+        echo "✅ State bucket cleanup completed"
+
+    - name: Verify Destruction
+      if: github.event.inputs.action == 'destroy'
+      run: |
+        echo "## 🔍 DESTRUCTION VERIFICATION" >> $GITHUB_STEP_SUMMARY
+        
+        # Check if EKS cluster still exists
+        CLUSTER_NAME="eks-cluster-d91584e3"
+        if aws eks describe-cluster --name "$CLUSTER_NAME" --region ${{ env.AWS_REGION }} 2>/dev/null; then
+          echo "❌ EKS cluster still exists!" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        else
+          echo "✅ EKS cluster successfully destroyed" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [[ "${{ github.event.inputs.destroy_backend }}" == "true" ]]; then
+          BUCKET_NAME="${{ steps.backend-config-destroy.outputs.bucket_name }}"
+          if aws s3 ls "s3://$BUCKET_NAME" 2>/dev/null; then
+            echo "❌ S3 bucket still exists!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ S3 bucket successfully destroyed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          DYNAMODB_TABLE="${{ steps.backend-config-destroy.outputs.dynamodb_table }}"
+          if aws dynamodb describe-table --table-name "$DYNAMODB_TABLE" --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "❌ DynamoDB table still exists!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ DynamoDB table successfully destroyed" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
+
+    - name: Cleanup Workflow Artifacts
+      if: github.event.inputs.action == 'destroy' && github.event.inputs.destroy_backend == 'true'
+      run: |
+        echo "🧹 Cleaning up GitHub workflow artifacts..."
+        # This step would ideally clean up any stored kubeconfig artifacts
+        echo "Note: Manually remove any stored kubeconfig artifacts from previous runs"
+
+    # COMMON SUMMARY
+    - name: Summary
+      run: |
+        ACTION="${{ github.event.inputs.action || 'plan' }}"
+        echo "## $ACTION Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Action**: $ACTION" >> $GITHUB_STEP_SUMMARY
+        echo "- **Terraform Version**: ${{ env.TF_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **AWS Region**: ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cluster Name**: ${{ vars.CLUSTER_NAME || 'eks-cluster' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Format Check**: ${{ steps.fmt.outcome }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Validation**: ${{ steps.validate.outcome }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ "$ACTION" != "destroy" ]]; then
+          echo "- **Plan**: ${{ steps.plan-deploy.outcome }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.apply-bootstrap.outcome }}" == "success" ]]; then
+            echo "- **Bootstrap**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+            echo "- **S3 Bucket**: ${{ steps.backend-config-deploy.outputs.bucket_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **DynamoDB Table**: ${{ steps.backend-config-deploy.outputs.dynamodb_table }}" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "- **Confirmation**: ${{ github.event.inputs.confirm_destroy }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Destroy Backend**: ${{ github.event.inputs.destroy_backend }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Actor**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ github.event.inputs.destroy_backend }}" == "true" ]]; then
+            echo "⚠️ **COMPLETE DESTRUCTION**: All infrastructure and state has been permanently deleted." >> $GITHUB_STEP_SUMMARY
+            echo "To redeploy, you will need to run the deploy workflow from scratch." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "🎯 **CLUSTER DESTRUCTION**: EKS cluster destroyed, state backend preserved." >> $GITHUB_STEP_SUMMARY
+            echo "You can redeploy the cluster anytime using the existing state backend." >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
