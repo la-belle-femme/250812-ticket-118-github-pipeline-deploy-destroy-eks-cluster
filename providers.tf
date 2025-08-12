@@ -18,14 +18,15 @@ terraform {
 provider "aws" {
   region = var.aws_region
 
-  default_tags {
-    tags = merge(var.tags, {
-      Environment = "development"
-      Project     = "EKS-GitHub-Actions"
-      ManagedBy   = "Terraform"
-      Repository  = var.github_repo
-    })
-  }
+  # Temporarily commented out to avoid iam:TagPolicy permission issues
+  # default_tags {
+  #   tags = merge(var.tags, {
+  #     Environment = "development"
+  #     Project     = "EKS-GitHub-Actions"
+  #     ManagedBy   = "Terraform"
+  #     Repository  = var.github_repo
+  #   })
+  # }
 }
 
 # Data sources for existing VPC resources
