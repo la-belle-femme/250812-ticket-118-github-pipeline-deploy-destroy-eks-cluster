@@ -9,6 +9,7 @@
 # }
 
 # Use existing GitHub OIDC Provider (data source only - no creation)
+# Use existing GitHub OIDC Provider (data source only - no creation)
 data "aws_iam_openid_connect_provider" "github" {
   url = "https://token.actions.githubusercontent.com"
 }
@@ -115,10 +116,11 @@ resource "aws_iam_policy" "github_actions_terraform" {
     ]
   })
 
-  tags = {
-    Name      = "eks-tf-state-${random_id.bucket_suffix.hex}"
-    ManagedBy = "terraform"
-  }
+  # Tags removed to avoid iam:TagPolicy permission requirement
+  # tags = {
+  #   Name      = "eks-tf-state-${random_id.bucket_suffix.hex}"
+  #   ManagedBy = "terraform"
+  # }
 }
 
 # IAM Policy for GitHub Actions - EKS Management
@@ -184,10 +186,11 @@ resource "aws_iam_policy" "github_actions_eks" {
     ]
   })
 
-  tags = {
-    Name      = "eks-mgmt-${random_id.bucket_suffix.hex}"
-    ManagedBy = "terraform"
-  }
+  # Tags removed to avoid iam:TagPolicy permission requirement
+  # tags = {
+  #   Name      = "eks-mgmt-${random_id.bucket_suffix.hex}"
+  #   ManagedBy = "terraform"
+  # }
 }
 
 # Attach Terraform state policy to GitHub Actions role
