@@ -1,5 +1,10 @@
 name: EKS Cluster Management
 
+# Prevent multiple concurrent runs
+concurrency:
+  group: eks-cluster-deployment
+  cancel-in-progress: true
+
 on:
   workflow_dispatch:
     inputs:
@@ -28,7 +33,7 @@ on:
     paths:
       - '**.tf'
       - '**.tfvars'
-      - '.github/workflows/unified-eks-workflow.yml'
+      - '.github/workflows/unified-eks-workflow-v3.yml'
   pull_request:
     branches:
       - main
@@ -168,8 +173,8 @@ jobs:
         echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
         echo "dynamodb_table=$DYNAMODB_TABLE" >> $GITHUB_OUTPUT
         
-        echo "ğŸ“¦ Using S3 bucket: $BUCKET_NAME"
-        echo "ğŸ”’ Using DynamoDB table: $DYNAMODB_TABLE"
+        echo "í³¦ Using S3 bucket: $BUCKET_NAME"
+        echo "í´’ Using DynamoDB table: $DYNAMODB_TABLE"
         
         # Remove any existing backend configuration
         rm -f backend.tf
@@ -190,31 +195,61 @@ jobs:
         echo "âœ… Backend configuration created"
         cat backend.tf
 
-    # DESTROY LOGIC - Backend Configuration
+    # DESTROY LOGIC - Backend Configuration (UPDATED TO BE DYNAMIC)
     - name: Get Backend Configuration (Destroy)
       if: github.event.inputs.action == 'destroy'
       id: backend-config-destroy
       run: |
-        # Use the exact bucket name we know exists
-        BUCKET_NAME="eks-tfstate-us-east-1-d91584e3"
-        DYNAMODB_TABLE="eks-tfstate-locks-d91584e3"
+        echo "í´ Discovering current infrastructure..."
+        
+        # Find the most recent EKS cluster
+        CLUSTER_NAME=$(aws eks list-clusters --region ${{ env.AWS_REGION }} --query 'clusters[0]' --output text 2>/dev/null || echo "")
+        
+        if [[ -z "$CLUSTER_NAME" || "$CLUSTER_NAME" == "None" ]]; then
+          echo "âŒ No EKS clusters found in region ${{ env.AWS_REGION }}"
+          echo "Nothing to destroy!"
+          exit 0
+        fi
+        
+        echo "í¾¯ Found EKS cluster: $CLUSTER_NAME"
+        
+        # Extract the random suffix from cluster name (e.g., eks-cluster-79741795 -> 79741795)
+        SUFFIX=$(echo $CLUSTER_NAME | sed 's/eks-cluster-//')
+        
+        # Construct bucket and table names
+        BUCKET_NAME="eks-tfstate-us-east-1-${SUFFIX}"
+        DYNAMODB_TABLE="eks-tfstate-locks-${SUFFIX}"
+        
+        echo "í³¦ Expected S3 bucket: $BUCKET_NAME"
+        echo "í´’ Expected DynamoDB table: $DYNAMODB_TABLE"
         
         # Verify bucket exists and has state file
-        echo "ğŸ“¦ Checking S3 bucket: $BUCKET_NAME"
-        aws s3 ls s3://$BUCKET_NAME/terraform.tfstate
-        
-        if [ $? -eq 0 ]; then
-          echo "âœ… Found Terraform state file"
+        if aws s3 ls s3://$BUCKET_NAME/terraform.tfstate >/dev/null 2>&1; then
+          echo "âœ… Found Terraform state file in $BUCKET_NAME"
         else
-          echo "âŒ No state file found in bucket"
-          exit 1
+          echo "âŒ No state file found in bucket $BUCKET_NAME"
+          echo "í´ Checking other eks-tfstate buckets..."
+          
+          # Find any eks-tfstate bucket with a state file
+          for bucket in $(aws s3 ls | grep eks-tfstate | awk '{print $3}'); do
+            if aws s3 ls s3://$bucket/terraform.tfstate >/dev/null 2>&1; then
+              echo "âœ… Found state file in: $bucket"
+              BUCKET_NAME=$bucket
+              # Extract suffix from bucket name
+              SUFFIX=$(echo $bucket | sed 's/eks-tfstate-us-east-1-//')
+              DYNAMODB_TABLE="eks-tfstate-locks-${SUFFIX}"
+              break
+            fi
+          done
         fi
         
         echo "bucket_name=$BUCKET_NAME" >> $GITHUB_OUTPUT
         echo "dynamodb_table=$DYNAMODB_TABLE" >> $GITHUB_OUTPUT
+        echo "cluster_name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
         
-        echo "ğŸ“¦ Using S3 bucket: $BUCKET_NAME"
-        echo "ğŸ”’ Using DynamoDB table: $DYNAMODB_TABLE"
+        echo "í³¦ Using S3 bucket: $BUCKET_NAME"
+        echo "í´’ Using DynamoDB table: $DYNAMODB_TABLE"
+        echo "í¾¯ Target cluster: $CLUSTER_NAME"
         
         # Create backend config file
         cat > backend.tf << EOF
@@ -239,7 +274,7 @@ jobs:
         (github.event.inputs.action == 'destroy')
       id: init
       run: |
-        echo "ğŸ”„ Initializing Terraform with S3 backend..."
+        echo "í´„ Initializing Terraform with S3 backend..."
         if [[ "${{ github.event.inputs.action }}" == "destroy" ]]; then
           terraform init
         else
@@ -304,7 +339,7 @@ jobs:
     - name: Show Destruction Plan
       if: github.event.inputs.action == 'destroy'
       run: |
-        echo "## ğŸš¨ DESTRUCTION PLAN" >> $GITHUB_STEP_SUMMARY
+        echo "## íº¨ DESTRUCTION PLAN" >> $GITHUB_STEP_SUMMARY
         echo "The following resources will be **PERMANENTLY DELETED**:" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         
@@ -315,7 +350,7 @@ jobs:
           echo "- DynamoDB Table (state locking)" >> $GITHUB_STEP_SUMMARY
           echo "- All IAM roles and policies" >> $GITHUB_STEP_SUMMARY
         else
-          echo "### ğŸ¯ EKS CLUSTER DESTRUCTION (PRESERVING STATE BACKEND)" >> $GITHUB_STEP_SUMMARY
+          echo "### í¾¯ EKS CLUSTER DESTRUCTION (PRESERVING STATE BACKEND)" >> $GITHUB_STEP_SUMMARY
           echo "- EKS Cluster and Node Groups" >> $GITHUB_STEP_SUMMARY
           echo "- Security Groups" >> $GITHUB_STEP_SUMMARY
           echo "- IAM Roles and Policies (EKS-related)" >> $GITHUB_STEP_SUMMARY
@@ -336,10 +371,10 @@ jobs:
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
-          const output = `#### Terraform Format and Style ğŸ–Œ\`${{ steps.fmt.outcome }}\`
+          const output = `#### Terraform Format and Style í¶Œ\`${{ steps.fmt.outcome }}\`
           #### Terraform Initialization âš™ï¸\`${{ steps.init.outcome }}\`
-          #### Terraform Validation ğŸ¤–\`${{ steps.validate.outcome }}\`
-          #### Terraform Plan ğŸ“–\`${{ steps.plan-deploy.outcome }}\`
+          #### Terraform Validation í´–\`${{ steps.validate.outcome }}\`
+          #### Terraform Plan í³–\`${{ steps.plan-deploy.outcome }}\`
 
           <details><summary>Show Plan</summary>
 
@@ -378,7 +413,7 @@ jobs:
         github.event.inputs.destroy_backend == 'false' &&
         (steps.plan-destroy-eks.outcome == 'success' || steps.plan-destroy-eks.outputs.exitcode == '2')
       run: |
-        echo "ğŸš¨ Starting EKS cluster destruction..."
+        echo "íº¨ Starting EKS cluster destruction..."
         terraform apply -auto-approve destroy-eks.tfplan
         echo "âœ… EKS cluster destroyed successfully!"
 
@@ -388,7 +423,7 @@ jobs:
         github.event.inputs.destroy_backend == 'true' &&
         (steps.plan-destroy-all.outcome == 'success' || steps.plan-destroy-all.outputs.exitcode == '2')
       run: |
-        echo "ğŸš¨ Starting complete infrastructure destruction..."
+        echo "íº¨ Starting complete infrastructure destruction..."
         terraform apply -auto-approve destroy-all.tfplan
         echo "âœ… All resources destroyed successfully!"
 
@@ -441,7 +476,7 @@ jobs:
       if: github.event.inputs.action == 'destroy' && github.event.inputs.destroy_backend == 'true'
       run: |
         BUCKET_NAME="${{ steps.backend-config-destroy.outputs.bucket_name }}"
-        echo "ğŸ§¹ Cleaning up state bucket: $BUCKET_NAME"
+        echo "í·¹ Cleaning up state bucket: $BUCKET_NAME"
         
         # Remove all objects from the bucket
         aws s3 rm s3://$BUCKET_NAME --recursive || true
@@ -462,18 +497,23 @@ jobs:
         
         echo "âœ… State bucket cleanup completed"
 
+    # UPDATED VERIFICATION STEP (USES DYNAMIC CLUSTER NAME)
     - name: Verify Destruction
       if: github.event.inputs.action == 'destroy'
       run: |
-        echo "## ğŸ” DESTRUCTION VERIFICATION" >> $GITHUB_STEP_SUMMARY
+        echo "## í´ DESTRUCTION VERIFICATION" >> $GITHUB_STEP_SUMMARY
         
-        # Check if EKS cluster still exists
-        CLUSTER_NAME="eks-cluster-d91584e3"
-        if aws eks describe-cluster --name "$CLUSTER_NAME" --region ${{ env.AWS_REGION }} 2>/dev/null; then
-          echo "âŒ EKS cluster still exists!" >> $GITHUB_STEP_SUMMARY
-          exit 1
-        else
-          echo "âœ… EKS cluster successfully destroyed" >> $GITHUB_STEP_SUMMARY
+        # Get the cluster name that was targeted for destruction
+        CLUSTER_NAME="${{ steps.backend-config-destroy.outputs.cluster_name }}"
+        
+        if [[ -n "$CLUSTER_NAME" && "$CLUSTER_NAME" != "None" ]]; then
+          # Check if EKS cluster still exists
+          if aws eks describe-cluster --name "$CLUSTER_NAME" --region ${{ env.AWS_REGION }} 2>/dev/null; then
+            echo "âŒ EKS cluster $CLUSTER_NAME still exists!" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "âœ… EKS cluster $CLUSTER_NAME successfully destroyed" >> $GITHUB_STEP_SUMMARY
+          fi
         fi
         
         if [[ "${{ github.event.inputs.destroy_backend }}" == "true" ]]; then
@@ -495,7 +535,7 @@ jobs:
     - name: Cleanup Workflow Artifacts
       if: github.event.inputs.action == 'destroy' && github.event.inputs.destroy_backend == 'true'
       run: |
-        echo "ğŸ§¹ Cleaning up GitHub workflow artifacts..."
+        echo "í·¹ Cleaning up GitHub workflow artifacts..."
         # This step would ideally clean up any stored kubeconfig artifacts
         echo "Note: Manually remove any stored kubeconfig artifacts from previous runs"
 
@@ -530,7 +570,7 @@ jobs:
             echo "âš ï¸ **COMPLETE DESTRUCTION**: All infrastructure and state has been permanently deleted." >> $GITHUB_STEP_SUMMARY
             echo "To redeploy, you will need to run the deploy workflow from scratch." >> $GITHUB_STEP_SUMMARY
           else
-            echo "ğŸ¯ **CLUSTER DESTRUCTION**: EKS cluster destroyed, state backend preserved." >> $GITHUB_STEP_SUMMARY
+            echo "í¾¯ **CLUSTER DESTRUCTION**: EKS cluster destroyed, state backend preserved." >> $GITHUB_STEP_SUMMARY
             echo "You can redeploy the cluster anytime using the existing state backend." >> $GITHUB_STEP_SUMMARY
           fi
         fi
